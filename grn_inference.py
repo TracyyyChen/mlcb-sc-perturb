@@ -1,4 +1,4 @@
-import argparse, os, sys, warnings
+import argparse, os, sys, warnings, shutil
 from pathlib import Path
 
 # sqlite shim for lamindb on some clusters
@@ -18,12 +18,11 @@ import torch
 
 LOCAL_DIR = Path("/tmp/zhanghy/lamindb").resolve()
 print(f"Using local instance directory: {LOCAL_DIR}")
-if not LOCAL_DIR.exists():
-    print("-> Initializing local anonymous instance...")
-    ln.setup.init(storage=str(LOCAL_DIR))
-else:
-    print("-> Local directory already exists, skipping init.")
-ln.connect("anonymous/lamindb")
+if LOCAL_DIR.exists():
+    shutil.rmtree(LOCAL_DIR)
+
+print("-> Initializing local anonymous instance...")
+ln.setup.init(storage=str(LOCAL_DIR), modules="bionty")
 print("\n✅ Connected successfully")
 print(f"lamindb version     : {ln.__version__}")
 print(f"lamindb-setup version: {lamindb_setup.__version__}")
@@ -123,7 +122,7 @@ if chosen is None:
     raise RuntimeError(f"Couldn’t find an H1-like cell_type. Seen: {sorted(list(present))[:12]}")
 
 print("Subsetting to H1 cell line:", chosen)
-adata = adata[adata.obs[ct_col] == chosen].copy()
+adata = adata[adata.obs[ct_col] == chosen]
 
 # --- choose layer ---
 layer = args.layer
@@ -141,12 +140,12 @@ if not isinstance(X, np.ndarray):
 
 gene_var = X.sum(axis=0)
 keep_idx = np.argsort(gene_var)[::-1][: min(args.num_genes, X.shape[1])]
-adata = adata[:, keep_idx].copy()
+adata = adata[:, keep_idx]
 
 # cell downsample
 if adata.n_obs > args.max_cells:
     sel = np.random.RandomState(0).choice(adata.n_obs, args.max_cells, replace=False)
-    adata = adata[sel].copy()
+    adata = adata[sel]
 
 print("adata_prep_obs:", adata.obs.columns)
 
@@ -348,7 +347,8 @@ try:
 except RuntimeError as e:
     if "not attached to a Trainer" in str(e):
         warnings.warn(str(e))
-        edges_df = gn(ckpt, adata)
+        edges_df = gn(ckpt, adata, cell_type=args.cell_type)
+        edges_df["ensembl_id"] = gn.var.index
     else:
         raise
 
@@ -359,7 +359,8 @@ print(f"[metrics] realized rows: {len(edges_df):,}  (expected {len(final_genes)*
 outdir = Path(args.outdir)
 outdir.mkdir(parents=True, exist_ok=True)
 edges_path = outdir / "edges_all.csv"
-edges_df.to_csv(edges_path, index=False)
+edges_df.to_pickle(edges_path, compression="gzip")
+#edges_df.to_csv(edges_path, index=False)
 print(f"Saved to: {edges_path}")
 print(edges_df.head(10))
 
