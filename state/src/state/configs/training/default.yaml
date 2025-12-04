@@ -11,6 +11,7 @@ loss_fn: mse
 devices: 1  # Number of GPUs to use for training
 strategy: auto  # DDP strategy for multi-GPU training
 use_mfu: true
+accelerator: cuda
 mfu_kwargs:
     available_flops: 60e12
     use_backward: true
