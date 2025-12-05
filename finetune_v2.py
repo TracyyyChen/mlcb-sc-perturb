@@ -29,6 +29,7 @@ def load_cfg(path: str) -> DictConfig:
 # -------------------------------------------------------------------------
 def load_laplacian(csv_path, gene_order, symmetric="max"):
     df = pd.read_csv(csv_path)
+
     if not {"source", "target"}.issubset(df.columns):
         raise ValueError("CSV must have columns: source,target[,weight]")
 
@@ -51,7 +52,6 @@ def load_laplacian(csv_path, gene_order, symmetric="max"):
     n = len(used_genes)
 
     A = sparse.coo_matrix((w, (iu, iv)), shape=(n, n)).tocsr()
-
     if symmetric == "max":
         A = A.maximum(A.T)
 
@@ -61,6 +61,18 @@ def load_laplacian(csv_path, gene_order, symmetric="max"):
     L = sparse.eye(n) - Dinv @ A @ Dinv
     return L.tocsr(), used_genes
 
+
+def gene_to_ensembl(gene_list, symbols_pkl):
+    """Load user-provided pkl to map symbols→Ensembl IDs."""
+    import pickle
+
+    if symbols_pkl is None or not os.path.exists(symbols_pkl):
+        raise FileNotFoundError(f"symbols_dict.pkl not found: {symbols_pkl}")
+
+    with open(symbols_pkl, "rb") as f:
+        mapping = pickle.load(f)
+
+    return [mapping.get(g, None) for g in gene_list]
 
 # -------------------------------------------------------------------------
 # Main finetuning logic
@@ -77,14 +89,27 @@ def run(cfg: DictConfig):
         cell_sentence_len=cfg.model.kwargs.get("cell_set_len", 128),
     )
     dm.setup("fit")
-    var_dims = dm.get_var_dims()
-    gene_order = dm.get_var_names()   # list of gene symbols in order
 
+    var_dims = dm.get_var_dims()
+    gene_order = dm.get_var_names()
+
+    # ----------------------------
+    # 2. Load symbol dictionary (optional)
+    # ----------------------------
+    if cfg.grn.get("symbols_dict", None) is not None:
+        print(f"Loading gene→Ensembl map: {cfg.grn.symbols_dict}")
+        ensembl_order = gene_to_ensembl(gene_order, cfg.grn.symbols_dict)
+    else:
+        ensembl_order = gene_order  # assume already Ensembl
+
+    # ----------------------------
+    # 3. Model decoder config
+    # ----------------------------
     if cfg.data.kwargs["output_space"] == "gene":
         gene_dim = var_dims.get("hvg_dim", 2000)
     else:
         gene_dim = var_dims.get("gene_dim", 2000)
-    
+
     decoder_cfg = {
         "latent_dim": int(var_dims["output_dim"]),
         "gene_dim": int(gene_dim),
@@ -93,52 +118,65 @@ def run(cfg: DictConfig):
         "residual_decoder": bool(cfg.model.kwargs.get("residual_decoder", False)),
     }
 
-    #cfg.model.kwargs["decoder_cfg"] = decoder_cfg
-    cfg["model"]["kwargs"]["decoder_cfg"] = decoder_cfg
-   
+    cfg.model.kwargs.decoder_cfg = decoder_cfg
+
     # ----------------------------
-    # 2. Build Model
+    # 4. Build Model
     # ----------------------------
     model = get_lightning_module(
-        cfg["model"]["name"],
-        cfg["data"]["kwargs"],
-        cfg["model"]["kwargs"],
-        cfg["training"],
-        var_dims,)
+        cfg.model.name,
+        cfg.data.kwargs,
+        cfg.model.kwargs,
+        cfg.training,
+        var_dims
+    )
     print("Returned model type:", type(model))
 
+    # Build decoder
     if hasattr(model, "_build_decoder"):
         model.decoder_cfg = decoder_cfg
         model._build_decoder()
         model._decoder_externally_configured = True
 
-    # Load pretrained checkpoint
+    # Load checkpoint
     ckpt_path = cfg.model.kwargs.get("init_from", None)
-    if ckpt_path is not None:
+    if ckpt_path:
         print(f"Loading pretrained checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["state_dict"], strict=False)
 
     # ----------------------------
-    # 3. Freeze everything except last N layers
+    # 5. Freeze everything except last N layers
     # ----------------------------
     n_layers = cfg.model.kwargs.get("finetune_last_layers", 2)
-    trainable = freeze_all_but_last_n_layers(model, n_layers=n_layers)
+    trainable = freeze_all_but_last_n_layers(model, n_layers)
     print(f"Trainable parameter tensors: {len(trainable)}")
 
     # ----------------------------
-    # 4. Build GRN regularizer (optional)
+    # 6. Build GRN regularizer
     # ----------------------------
     grn_reg = None
-    if "grn" in cfg and cfg.grn.get("path") is not None:
-        print("Loading GRN edges:", cfg.grn.path)
-        L, used_genes = load_laplacian(cfg.grn.path, gene_order)
+    grn_path = cfg.grn.get("path", None)
+
+    if grn_path:
+        print("Loading GRN edges:", grn_path)
+        L, used = load_laplacian(grn_path, ensembl_order)
+
         if L is not None:
             print("Constructing GRN Regularizer")
-            ordered_indices = [gene_order.index(g) for g in used_genes]
-            grn_reg = GRNReg(model, L, ordered_indices, grn_lambda=cfg.grn.get("lambda", 1e-3))
 
-    # Wrap training_step to insert GRN loss
+            # index mapping into model gene order
+            used_idx = []
+            for g in used:
+                if g in ensembl_order:
+                    used_idx.append(ensembl_order.index(g))
+
+            if len(used_idx) == 0:
+                print("[WARN] No GRN genes aligned to dataset genes.")
+            else:
+                grn_reg = GRNReg(model, L, used_idx, grn_lambda=cfg.grn.get("lambda", 1e-3))
+
+    # inject GRN loss
     orig_ts = model.training_step
     def ts_with_grn(batch, batch_idx):
         loss = orig_ts(batch, batch_idx)
@@ -151,41 +189,34 @@ def run(cfg: DictConfig):
     model.training_step = ts_with_grn
 
     # ----------------------------
-    # 5. Optimizer
+    # 7. Optimizer
     # ----------------------------
     lr = cfg.training.get("lr", 2e-5)
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                  lr=lr, weight_decay=cfg.training.get("weight_decay", 0.01))
+    wd = cfg.training.get("weight_decay", 0.01)
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr, weight_decay=wd
+    )
     model.configure_optimizers = lambda: optimizer
 
     # ----------------------------
-    # 6. Trainer
+    # 8. Trainer
     # ----------------------------
     trainer = pl.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=cfg.training.get("devices", 1),
+        devices=cfg.training.devices,
         max_steps=cfg.training.max_steps,
         val_check_interval=cfg.training.val_freq,
         log_every_n_steps=cfg.training.log_every_n_steps,
         strategy=cfg.training.strategy,
-        callbacks=[],
+        callbacks=[]
     )
 
     print("Starting training...")
     trainer.fit(model, datamodule=dm)
     print("Training complete.")
 
-
-# -------------------------------------------------------------------------
-# Entry point
-# -------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser("Finetuning v2")
-    parser.add_argument("--hparams", type=str, default="finetune_v2.yaml")
-    args = parser.parse_args()
-
-    cfg = load_cfg(args.hparams)
-    run(cfg)
 
 
 if __name__ == "__main__":
