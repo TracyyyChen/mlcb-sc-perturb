@@ -218,6 +218,22 @@ def run(cfg: DictConfig):
     print("Training complete.")
 
 
+def main():
+    parser = argparse.ArgumentParser("Finetuning v2")
+    parser.add_argument("--hparams", type=str, default="finetune_v2.yaml")
+    parser.add_argument("--grn-path", type=str, default=None)
+    parser.add_argument("--symbols-dict", type=str, default=None)
+    args = parser.parse_args()
+
+    cfg = load_cfg(args.hparams)
+
+    # override if provided
+    if args.grn_path:
+        cfg.grn.path = args.grn_path
+    if args.symbols_dict:
+        cfg.grn.symbols_dict = args.symbols_dict
+
+    run(cfg)
 
 if __name__ == "__main__":
     main()
