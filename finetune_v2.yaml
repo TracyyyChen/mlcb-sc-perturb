@@ -1,0 +1,101 @@
+output_dir: ./ft-out
+name: ft_grn_smoothing
+overwrite: true
+
+use_wandb: false
+wandb:
+  tags: "[ft_grn]"
+  project: "vcc"
+  entity: "test"
+  local_wandb_dir: "wandb-ft"
+
+data:
+  name: PerturbationDataModule
+  kwargs:
+    toml_config_path: "${env:HOME}/mlcb/mlcb-sc-perturb/competition_support_set/starter.toml"
+    embed_key: null
+    output_space: all
+    pert_rep: onehot
+    basal_rep: sample
+    num_workers: 8
+    pin_memory: true
+    n_basal_samples: 1
+    basal_mapping_strategy: random
+    should_yield_control_cells: true
+    batch_col: "batch_var"
+    pert_col: "target_gene"
+    cell_type_key: "cell_type"
+    control_pert: "non-targeting"
+    map_controls: true
+    perturbation_features_file: "${env:HOME}/mlcb/mlcb-sc-perturb/competition_support_set/ESM2_pert_features.pt"
+    store_raw_basal: false
+    int_counts: false
+    barcode: true
+
+
+# -----------------------------------------------
+# MODEL CONFIG
+# -----------------------------------------------
+model:
+  name: state
+  kwargs:
+    cell_set_len: 128
+    blur: 0.05
+    hidden_dim: 672
+    loss: energy
+    n_encoder_layers: 4
+    n_decoder_layers: 4
+    predict_residual: True
+    use_basal_projection: False
+    batch_encoder: False
+    nb_decoder: False
+    mask_attn: False
+    distributional_loss: energy
+    gene_decoder_bool: False
+
+    # IMPORTANT: load your pretrained STATE here:
+    transformer_backbone_key: llama
+    transformer_backbone_kwargs:
+      init_from: "${env:HOME}/mlcb/mlcb-sc-perturb/competition/test_run/checkpoints/'step=20000.ckpt'"
+      bidirectional_attention: false
+      max_position_embeddings: ${model.kwargs.cell_set_len}
+      hidden_size: ${model.kwargs.hidden_dim}
+      intermediate_size: 2688
+      num_hidden_layers: 4
+      num_attention_heads: 8
+      num_key_value_heads: 8
+      head_dim: 84
+      use_cache: false
+      attention_dropout: 0.0
+      hidden_dropout: 0.0
+      layer_norm_eps: 1e-6
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: 2
+      rotary_dim: 0
+      use_rotary_embeddings: false
+
+# -----------------------------------------------
+# TRAINING CONFIG
+# -----------------------------------------------
+training:
+  batch_size: 1
+  lr: 2e-5
+  weight_decay: 0.01
+  max_steps: 20
+  val_freq: 10
+  train_seed: 1337
+  gradient_clip_val: 1.0
+  devices: 1
+  strategy: auto
+  log_every_n_steps: 50
+  use_mfu: false
+  cumulative_flops_use_backward: false
+  ckpt_every_n_steps: 10
+
+# -----------------------------------------------
+# GRN CONFIG
+# -----------------------------------------------
+grn:
+  path: "${env:HOME}/mlcb/mlcb-sc-perturb/edges_all.csv"
+  lambda: 0
