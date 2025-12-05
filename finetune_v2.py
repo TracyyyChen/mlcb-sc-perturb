@@ -80,16 +80,37 @@ def run(cfg: DictConfig):
     var_dims = dm.get_var_dims()
     gene_order = dm.get_var_names()   # list of gene symbols in order
 
+    if cfg.data.kwargs["output_space"] == "gene":
+        gene_dim = var_dims.get("hvg_dim", 2000)
+    else:
+        gene_dim = var_dims.get("gene_dim", 2000)
+    
+    decoder_cfg = {
+        "latent_dim": int(var_dims["output_dim"]),
+        "gene_dim": int(gene_dim),
+        "hidden_dims": [int(x) for x in cfg.model.kwargs.get("decoder_hidden_dims", [1024, 1024, 512])],
+        "dropout": float(cfg.model.kwargs.get("decoder_dropout", 0.1)),
+        "residual_decoder": bool(cfg.model.kwargs.get("residual_decoder", False)),
+    }
+
+    #cfg.model.kwargs["decoder_cfg"] = decoder_cfg
+    cfg["model"]["kwargs"]["decoder_cfg"] = decoder_cfg
+   
     # ----------------------------
     # 2. Build Model
     # ----------------------------
     model = get_lightning_module(
-        cfg.model.name,
-        cfg.data.kwargs,
-        cfg.model.kwargs,
-        cfg.training,
-        var_dims,
-    )
+        cfg["model"]["name"],
+        cfg["data"]["kwargs"],
+        cfg["model"]["kwargs"],
+        cfg["training"],
+        var_dims,)
+    print("Returned model type:", type(model))
+
+    if hasattr(model, "_build_decoder"):
+        model.decoder_cfg = decoder_cfg
+        model._build_decoder()
+        model._decoder_externally_configured = True
 
     # Load pretrained checkpoint
     ckpt_path = cfg.model.kwargs.get("init_from", None)
