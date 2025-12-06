@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
 import argparse
 import numpy as np
 import pandas as pd
 import scanpy as sc
 from scipy import sparse
-from scipy.sparse.linalg import splu
+from scipy.sparse.linalg import cg
 import pickle
 import sys
 
@@ -15,10 +16,7 @@ def load_symbol_dict(path):
     print(f"[INFO] Loading symbol→Ensembl mapping: {path}")
     with open(path, "rb") as f:
         mapping = pickle.load(f)
-
-    # Basic sanity check
-    if len(mapping) < 100:
-        print("[WARN] Mapping file seems very small. Check that this is correct.")
+    print(f"[INFO] Mapping contains {len(mapping)} entries.")
     return mapping
 
 
@@ -26,24 +24,23 @@ def load_symbol_dict(path):
 # Build Laplacian from GRN edgelist using Ensembl IDs
 # ----------------------------------------------------------------------
 def load_laplacian(grn_csv, gene_order_ensembl):
-    print(f"[INFO] Loading GRN from: {grn_csv}")
+    print(f"[INFO] Loading GRN CSV: {grn_csv}")
     df = pd.read_csv(grn_csv)
 
     if not {"source", "target"}.issubset(df.columns):
-        raise ValueError("GRN CSV must contain columns: source, target [, weight]")
+        raise ValueError("GRN CSV must contain columns: source,target[,weight]")
 
     if "weight" not in df:
         df["weight"] = 1.0
 
     # Filter edges to genes present in dataset
     df = df[df["source"].isin(gene_order_ensembl) & df["target"].isin(gene_order_ensembl)]
-
     used_genes = sorted(set(df["source"]) | set(df["target"]))
-    print(f"[INFO] GRN edges originally: {len(df)}")
-    print(f"[INFO] GRN overlapping genes with dataset: {len(used_genes)}")
+
+    print(f"[INFO] GRN edges after filtering: {len(df)}")
+    print(f"[INFO] Overlapping genes: {len(used_genes)}")
 
     if len(used_genes) == 0:
-        print("[ERROR] No overlap between GRN genes and prediction genes.")
         return None, [], []
 
     gene_to_idx = {g: i for i, g in enumerate(used_genes)}
@@ -58,119 +55,109 @@ def load_laplacian(grn_csv, gene_order_ensembl):
     # Symmetrize adjacency
     A = A.maximum(A.T)
 
-    # Build normalized Laplacian
+    # Normalized Laplacian
     deg = np.asarray(A.sum(axis=1)).flatten()
     D_inv_sqrt = sparse.diags(1.0 / np.sqrt(deg + 1e-12))
     L = sparse.eye(n) - D_inv_sqrt @ A @ D_inv_sqrt
 
-    # Map used_genes back into full gene order
+    # Map used genes to global index
     used_idx = [gene_order_ensembl.index(g) for g in used_genes]
 
     return L.tocsr(), used_idx, used_genes
 
 
 # ----------------------------------------------------------------------
-# Precompute the linear solver for (I + τ L)
+# Apply smoothing using conjugate gradient
 # ----------------------------------------------------------------------
-def precompute_solver(L, tau):
-    print("[INFO] Precomputing LU factorization for (I + tau * L)...")
-    I = sparse.eye(L.shape[0], format="csr")
-    M = (I + tau * L).tocsc()
-    solver = splu(M)
-    return solver
+def apply_smoothing(vec, M, used_idx):
+    """Solve (I + tau L) y = x using conjugate gradient."""
+    b = vec[used_idx]
 
+    y, info = cg(M, b, tol=1e-4, maxiter=500)
 
-# ----------------------------------------------------------------------
-# Apply smoothing to vector using precomputed solver
-# ----------------------------------------------------------------------
-def apply_smoothing(vec, solver, used_idx):
-    subvec = vec[used_idx]
-    smoothed = solver.solve(subvec)
+    if info != 0:
+        print(f"[WARN] CG did not converge (info={info})")
+
     out = vec.copy()
-    out[used_idx] = smoothed
+    out[used_idx] = y
     return out
 
 
 # ----------------------------------------------------------------------
-# Main smoothing logic
+# Main smoothing pipeline
 # ----------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Apply GRN Laplacian smoothing to prediction h5ad.")
-    parser.add_argument("--pred-h5ad", required=True, help="Prediction h5ad file")
-    parser.add_argument("--grn-csv", required=True, help="GRN edgelist CSV (Ensembl IDs)")
-    parser.add_argument("--symbols-pkl", required=True, help="symbol → Ensembl mapping")
-    parser.add_argument("--tau", type=float, default=0.1, help="Diffusion strength τ")
-    parser.add_argument("--out", required=True, help="Output .h5ad file path")
+    parser = argparse.ArgumentParser(description="Apply GRN Laplacian smoothing (CG-based).")
+    parser.add_argument("--pred-h5ad", required=True)
+    parser.add_argument("--grn-csv", required=True)
+    parser.add_argument("--symbols-pkl", required=True)
+    parser.add_argument("--tau", type=float, default=0.1)
+    parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("[INFO] Loading prediction h5ad:", args.pred_h5ad)
-    adata = sc.read_h5ad(args.pred_h5ad)
-    print(f"[INFO] Loaded predictions with shape: {adata.shape}")
-    print("=" * 60)
+    print("=" * 80)
+    print("[INFO] Loading predictions:", args.pred_h5ad)
+    ad = sc.read_h5ad(args.pred_h5ad)
+    print(f"[INFO] Prediction shape: {ad.shape}")
+    print("=" * 80)
 
-    # --------------------------------------------------------
-    # Map var_names (gene symbols) → Ensembl IDs
-    # --------------------------------------------------------
+    # ------------------- Load symbol→Ensembl -------------------
     mapping = load_symbol_dict(args.symbols_pkl)
 
-    var_symbols = list(adata.var_names)
-    gene_order_ensembl = [mapping.get(sym, None) for sym in var_symbols]
+    var_symbols = list(ad.var_names)
+    gene_order_ensembl = [mapping.get(gs, None) for gs in var_symbols]
 
-    # Check mapping coverage
-    n_mapped = sum(g is not None for g in gene_order_ensembl)
-    print(f"[INFO] Successfully mapped {n_mapped}/{len(var_symbols)} genes to Ensembl IDs.")
+    mapped = sum(g is not None for g in gene_order_ensembl)
+    print(f"[INFO] Successfully mapped {mapped}/{len(var_symbols)} genes to Ensembl IDs.")
 
-    if n_mapped == 0:
-        print("[ERROR] No genes were mapped to Ensembl IDs. Smoothing cannot proceed.")
+    if mapped == 0:
+        print("[ERROR] No genes mapped. Check mapping file.")
         sys.exit(1)
 
-    # Replace unmapped genes with None (they will be ignored)
-    gene_order_ensembl = np.array(gene_order_ensembl, dtype=object)
+    # Replace None with placeholder string (ignored later)
+    gene_order_ensembl = np.array([
+        g if g is not None else "___UNMAPPED___"
+        for g in gene_order_ensembl
+    ], dtype=object)
 
-    # --------------------------------------------------------
-    # Build Laplacian from GRN
-    # --------------------------------------------------------
+    # ------------------- Build Laplacian -------------------
     L, used_idx, used_genes = load_laplacian(args.grn_csv, list(gene_order_ensembl))
 
     if L is None or len(used_idx) == 0:
-        print("[ERROR] No overlapping genes after mapping. Exiting.")
-        adata.write(args.out)
+        print("[ERROR] No overlapping genes found between GRN and predictions.")
+        ad.write(args.out)
         return
 
+    print(f"[INFO] Laplacian size: {L.shape}")
     print(f"[INFO] Number of genes smoothed: {len(used_idx)}")
-    print("=" * 60)
 
-    # --------------------------------------------------------
-    # Build solver
-    # --------------------------------------------------------
-    solver = precompute_solver(L, args.tau)
+    # ------------------- Construct (I + tau L) -------------------
+    print("[INFO] Constructing operator M = I + tau*L ...")
+    I = sparse.eye(L.shape[0], format="csr")
+    M = (I + args.tau * L).tocsr()
 
-    # --------------------------------------------------------
-    # Apply smoothing
-    # --------------------------------------------------------
-    X = adata.X
+    # ------------------- Apply smoothing -------------------
+    X = ad.X
     if sparse.issparse(X):
-        print("[INFO] Converting sparse matrix → dense")
+        print("[INFO] Converting sparse matrix → dense matrix")
         X = X.toarray()
 
-    print("[INFO] Applying smoothing row-by-row...")
-    n = X.shape[0]
+    print(f"[INFO] Starting smoothing on {X.shape[0]} cells...")
 
-    for i in range(n):
-        X[i] = apply_smoothing(X[i], solver, used_idx)
-        if i % 500 == 0:
-            print(f"  Smoothed {i}/{n}")
+    for i in range(X.shape[0]):
+        X[i] = apply_smoothing(X[i], M, used_idx)
+        if i % 200 == 0:
+            print(f"  Smoothed {i}/{X.shape[0]}")
 
-    adata.X = X
+    print("[INFO] Smoothing complete.")
+    ad.X = X
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-    print(f"[INFO] Writing output to: {args.out}")
-    adata.write(args.out)
-    print("[INFO] Done. Smoothing complete.")
-    print("=" * 60)
+    # ------------------- Save output -------------------
+    print("[INFO] Writing smoothed output to:", args.out)
+    ad.write(args.out)
+
+    print("[INFO] Done.")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
