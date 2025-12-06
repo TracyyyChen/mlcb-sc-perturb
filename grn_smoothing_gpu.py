@@ -6,43 +6,48 @@ import pandas as pd
 import scanpy as sc
 from scipy import sparse
 import torch
+import pickle
 
 
 # ================================================================
-# GPU Conjugate Gradient Solver (for A x = b)
+# GPU Conjugate Gradient Solver (batched + torch.linalg.cg)
 # ================================================================
-def cg_solve_gpu(L_gpu, b, tau=0.1, tol=1e-3, max_iter=200):
+def cg_batch_solve(L_gpu_T, B, tau=0.1, tol=1e-3, max_iter=200):
     """
-    Solve (I + τL) x = b using conjugate gradient on GPU.
-    L_gpu: sparse CSR tensor (n, n)
-    b: dense vector (n,)
+    Solve (I + τL) X = B  for a batch of rows.
+    B: (batch, n)
+    Returns: (batch, n)
     """
-    device = b.device
-    n = b.numel()
 
-    # A(x) = x + tau * (L @ x)
-    def matvec(x):
-        return x + tau * torch.matmul(L_gpu, x)
+    device = B.device
+    batch, n = B.shape
 
-    x = torch.zeros_like(b)
-    r = b.clone()            # r0 = b - A(0)
-    p = r.clone()
-    rs_old = torch.dot(r, r)
+    def mv(X):
+        # X: (batch, n)
+        # L_gpu_T: (n, n) sparse CSR
+        return X + tau * torch.matmul(X, L_gpu_T)  # (batch,n) @ (n,n)
 
-    for _ in range(max_iter):
-        Ap = matvec(p)
-        alpha = rs_old / (torch.dot(p, Ap) + 1e-12)
-        x = x + alpha * p
-        r = r - alpha * Ap
-        rs_new = torch.dot(r, r)
+    # Wrap mv into a torch LinearOperator
+    A = torch.linalg.LinearOperator(
+        dtype=torch.float32,
+        shape=(n, n),
+        matmul=mv,
+    )
 
-        if torch.sqrt(rs_new) < tol:
-            break
+    # Solve each row independently
+    X_out = torch.empty_like(B)
 
-        p = r + (rs_new / (rs_old + 1e-12)) * p
-        rs_old = rs_new
+    for i in range(batch):
+        x, info = torch.linalg.cg(
+            A,
+            B[i],
+            rtol=tol,
+            atol=0,
+            maxiter=max_iter,
+        )
+        X_out[i] = x
 
-    return x
+    return X_out
 
 
 # ================================================================
@@ -56,7 +61,7 @@ def load_laplacian_from_parquet(path, gene_order):
     if not required.issubset(df.columns):
         raise ValueError(f"Parquet must contain columns: {required}")
 
-    # Keep only edges whose genes appear in the dataset
+    # Restrict to genes present in prediction matrix
     df = df[df["source"].isin(gene_order) & df["target"].isin(gene_order)]
     print(f"[INFO] GRN filtered edges: {len(df)}")
 
@@ -79,18 +84,22 @@ def load_laplacian_from_parquet(path, gene_order):
     L = sparse.eye(n) - D_inv @ A @ D_inv
     L = L.tocsr()
 
-    # Convert to PyTorch sparse CSR for GPU matmul
+    # PyTorch CSR
     L_gpu = torch.sparse_csr_tensor(
         torch.tensor(L.indptr, dtype=torch.int64),
         torch.tensor(L.indices, dtype=torch.int64),
         torch.tensor(L.data, dtype=torch.float32),
         size=L.shape,
-    ).cuda()
+        device="cuda"
+    )
 
-    # Map used genes back to full matrix indices
+    # Precompute transpose for faster batch matvec
+    L_gpu_T = L_gpu.transpose(0, 1).contiguous()
+
+    # Local index mapping
     used_idx = np.array([gene_order.index(g) for g in used_genes], dtype=int)
 
-    return L_gpu, used_idx, used_genes
+    return L_gpu_T, used_idx, used_genes
 
 
 # ================================================================
@@ -103,24 +112,24 @@ def main():
     parser.add_argument("--symbols-dict", required=True)
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--rows", type=int, default=None)
+    parser.add_argument("--batch", type=int, default=128)  # NEW
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
     # ---------------------------------------------------------
-    # Load prediction matrix
+    # Load prediction matrix (NO `.toarray()` — keep sparse!)
     # ---------------------------------------------------------
     print(f"[INFO] Loading predictions: {args.pred_h5ad}")
     ad = sc.read_h5ad(args.pred_h5ad)
-    X_original = ad.X.toarray() if hasattr(ad.X, "toarray") else ad.X
-    n_cells, n_genes = X_original.shape
+    X_original = ad.X  # KEEP SPARSE
 
+    n_cells, n_genes = X_original.shape
     print(f"[INFO] Prediction shape: {X_original.shape}")
 
     # ---------------------------------------------------------
-    # Load gene→Ensembl mapping
+    # Load symbol → Ensembl mapping
     # ---------------------------------------------------------
     print(f"[INFO] Loading symbol→Ensembl mapping: {args.symbols_dict}")
-    import pickle
     with open(args.symbols_dict, "rb") as f:
         mapping = pickle.load(f)
 
@@ -128,65 +137,68 @@ def main():
     mask_mapped = np.array([g is not None for g in gene_order])
     gene_order = np.array(gene_order)[mask_mapped].tolist()
 
-    # Create reduced matrix only for mapped genes
+    # Extract mapped gene submatrix (still sparse)
     X_mapped = X_original[:, mask_mapped]
-    print(f"[INFO] Mapped genes: {len(gene_order)}")
 
     # ---------------------------------------------------------
     # Load Laplacian
     # ---------------------------------------------------------
-    L_gpu, used_idx_local, used_genes = load_laplacian_from_parquet(
+    L_gpu_T, used_idx_local, used_genes = load_laplacian_from_parquet(
         args.grn_parquet, gene_order
     )
+    print(f"[INFO] GRN genes: {len(used_idx_local)}")
 
-    print(f"[INFO] Laplacian shape: {L_gpu.shape}")
-    print(f"[INFO] Number of GRN genes: {len(used_idx_local)}")
+    # Subset mapped genes to GRN overlap
+    X_grn = X_mapped[:, used_idx_local]  # still sparse CSR
 
-    # X_grn: matrix of only GRN genes
-    X_grn = X_mapped[:, used_idx_local].copy()
-
-    # ---------------------------------------------------------
-    # How many rows to smooth
-    # ---------------------------------------------------------
     rows = X_grn.shape[0] if args.rows is None else args.rows
     print(f"[INFO] Smoothing {rows} rows...")
 
-    smoothed = np.zeros_like(X_grn[:rows])
+    smoothed = np.zeros((rows, len(used_idx_local)), dtype=np.float32)
 
     # ---------------------------------------------------------
-    # Run smoothing on GPU
+    # Batch CG smoothing
     # ---------------------------------------------------------
-    for i in range(rows):
-        v = torch.tensor(X_grn[i], dtype=torch.float32, device="cuda")
-        x_smooth = cg_solve_gpu(L_gpu, v, tau=args.tau)
-        smoothed[i] = x_smooth.cpu().numpy()
+    batch = args.batch
 
-        if i % 1000 == 0:
-            print(f"  [GPU CG] Smoothed {i}/{rows}")
+    for start in range(0, rows, batch):
+        end = min(start + batch, rows)
+
+        # Extract sparse rows & densify ON GPU
+        B = torch.tensor(
+            X_grn[start:end].toarray(),  # small dense slice only
+            dtype=torch.float32,
+            device="cuda"
+        )
+
+        X_smooth = cg_batch_solve(L_gpu_T, B, tau=args.tau)
+        smoothed[start:end] = X_smooth.cpu().numpy()
+
+        print(f"[GPU CG] {start}/{rows} rows done")
 
     # Insert smoothed rows
-    X_grn[:rows] = smoothed
+    X_grn_dense = smoothed
 
     # ---------------------------------------------------------
     # Reconstruct full matrix
     # ---------------------------------------------------------
     print("[INFO] Reconstructing full matrix...")
+    full = np.zeros((n_cells, n_genes), dtype=np.float32)
 
-    full_X = np.zeros((n_cells, n_genes), dtype=np.float32)
+    mask_full = np.where(mask_mapped)[0]
 
-    # Insert GRN-smoothed genes → mapped gene positions → used_idx positions
-    mask_full = np.where(mask_mapped)[0]  # absolute positions of mapped genes
-    full_X[:, mask_full[used_idx_local]] = X_grn
+    # Insert GRN-smoothed genes
+    full[:, mask_full[used_idx_local]] = X_grn_dense
 
-    # Copy over non-GRN but mapped genes
-    non_grn_local = np.setdiff1d(np.arange(len(mask_full)), used_idx_local)
-    full_X[:, mask_full[non_grn_local]] = X_mapped[:, non_grn_local]
+    # Insert non-GRN mapped genes
+    non_grn = np.setdiff1d(np.arange(len(mask_full)), used_idx_local)
+    full[:, mask_full[non_grn]] = X_mapped[:, non_grn].toarray()
 
-    # Copy unmapped genes
-    full_X[:, ~mask_mapped] = X_original[:, ~mask_mapped]
+    # Insert unmapped genes
+    full[:, ~mask_mapped] = X_original[:, ~mask_mapped].toarray()
 
-    # Save
-    ad.X = full_X
+    ad.X = full
+
     print(f"[INFO] Writing output H5AD: {args.out}")
     ad.write(args.out)
 
