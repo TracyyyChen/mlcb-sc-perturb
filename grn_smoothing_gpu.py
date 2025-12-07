@@ -12,42 +12,47 @@ import pickle
 # ================================================================
 # GPU Conjugate Gradient Solver (batched + torch.linalg.cg)
 # ================================================================
-def cg_batch_solve(L_gpu_T, B, tau=0.1, tol=1e-3, max_iter=200):
+def cg_batch_solve(L_gpu, B, tau=0.1, tol=1e-3, max_iter=200):
     """
-    Solve (I + τL) X = B  for a batch of rows.
-    B: (batch, n)
-    Returns: (batch, n)
+    Solve (I + τL) X = B using classic Conjugate Gradient.
+    L_gpu: sparse CSR (n,n)
+    B: (batch,n)
     """
 
     device = B.device
     batch, n = B.shape
 
-    def mv(X):
-        # X: (batch, n)
-        # L_gpu_T: (n, n) sparse CSR
-        return X + tau * torch.matmul(X, L_gpu_T)  # (batch,n) @ (n,n)
+    # Matrix-vector multiply: y = (I + τL) x
+    def matvec(x):
+        # x: (batch,n)
+        # (batch,n) + τ * (batch,n)@(n,n)
+        return x + tau * torch.matmul(x, L_gpu)
 
-    # Wrap mv into a torch LinearOperator
-    A = torch.linalg.LinearOperator(
-        dtype=torch.float32,
-        shape=(n, n),
-        matmul=mv,
-    )
+    X = torch.zeros_like(B)
+    R = B - matvec(X)
+    P = R.clone()
 
-    # Solve each row independently
-    X_out = torch.empty_like(B)
+    rs_old = (R * R).sum(dim=1)  # (batch,)
 
-    for i in range(batch):
-        x, info = torch.linalg.cg(
-            A,
-            B[i],
-            rtol=tol,
-            atol=0,
-            maxiter=max_iter,
-        )
-        X_out[i] = x
+    for _ in range(max_iter):
+        AP = matvec(P)                     # (batch,n)
+        alpha = rs_old / (AP * P).sum(dim=1).clamp(min=1e-12)
+        alpha = alpha.view(-1, 1)
 
-    return X_out
+        X = X + alpha * P
+        R = R - alpha * AP
+
+        rs_new = (R * R).sum(dim=1)
+
+        if torch.all(rs_new < tol):
+            break
+
+        beta = (rs_new / rs_old).view(-1, 1)
+        P = R + beta * P
+
+        rs_old = rs_new
+
+    return X
 
 
 # ================================================================
@@ -93,13 +98,9 @@ def load_laplacian_from_parquet(path, gene_order):
         device="cuda"
     )
 
-    # Precompute transpose for faster batch matvec
-    L_gpu_T = L_gpu.transpose(0, 1).contiguous()
-
-    # Local index mapping
     used_idx = np.array([gene_order.index(g) for g in used_genes], dtype=int)
 
-    return L_gpu_T, used_idx, used_genes
+    return L_gpu, used_idx, used_genes
 
 
 # ================================================================
@@ -143,7 +144,7 @@ def main():
     # ---------------------------------------------------------
     # Load Laplacian
     # ---------------------------------------------------------
-    L_gpu_T, used_idx_local, used_genes = load_laplacian_from_parquet(
+    L_gpu, used_idx_local, used_genes = load_laplacian_from_parquet(
         args.grn_parquet, gene_order
     )
     print(f"[INFO] GRN genes: {len(used_idx_local)}")
@@ -166,12 +167,12 @@ def main():
 
         # Extract sparse rows & densify ON GPU
         B = torch.tensor(
-            X_grn[start:end].toarray(),  # small dense slice only
+            X_grn[start:end],  # small dense slice only
             dtype=torch.float32,
             device="cuda"
         )
 
-        X_smooth = cg_batch_solve(L_gpu_T, B, tau=args.tau)
+        X_smooth = cg_batch_solve(L_gpu, B, tau=args.tau)
         smoothed[start:end] = X_smooth.cpu().numpy()
 
         print(f"[GPU CG] {start}/{rows} rows done")
