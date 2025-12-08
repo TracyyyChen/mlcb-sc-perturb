@@ -8,28 +8,37 @@ from scipy import sparse
 import torch
 import pickle
 
-
-# GPU Conjugate Gradient Solver (batched + torch.linalg.cg)
+# Conjugate Gradient with (L @ X.T).T instead of (X @ L)
 def cg_batch_solve(L_gpu, B, tau=0.1, tol=1e-3, max_iter=200):
     """
-    Solve (I + τL) X = B using classic Conjugate Gradient.
+    Solve (I + τL) X = B
+    using Conjugate Gradient.
+
     L_gpu: sparse CSR (n,n)
-    B: (batch,n)
+    B: (batch, n)
     """
 
     device = B.device
     batch, n = B.shape
 
-    # Matrix-vector multiply: y = (I + τL) x
+    # ------------------------------
+    # NEW matvec: (L @ x.T).T
+    # ------------------------------
     def matvec(x):
-        # x: (batch,n)
-        # (batch,n) + τ * (batch,n)@(n,n)
-        return x + tau * torch.matmul(x, L_gpu)
+        """
+        x: (batch, n)
+        returns: x + τ * (L @ xᵀ)ᵀ
+        """
+        # x.T → (n, batch)
+        # L @ x.T → (n, batch)
+        # .T → (batch, n)
+        Lx = torch.matmul(L_gpu, x.T).T
+        return x + tau * Lx
 
+    # CG initialization
     X = torch.zeros_like(B)
     R = B - matvec(X)
     P = R.clone()
-
     rs_old = (R * R).sum(dim=1)
 
     for _ in range(max_iter):
@@ -53,8 +62,7 @@ def cg_batch_solve(L_gpu, B, tau=0.1, tol=1e-3, max_iter=200):
     return X
 
 
-
-# Load Laplacian from Parquet
+# Load Laplacian from GRN parquet
 def load_laplacian_from_parquet(path, gene_order):
     print(f"[INFO] Reading GRN parquet: {path}")
     df = pd.read_parquet(path)
@@ -85,7 +93,7 @@ def load_laplacian_from_parquet(path, gene_order):
     L = sparse.eye(n) - D_inv @ A @ D_inv
     L = L.tocsr()
 
-    # PyTorch CSR
+    # Convert to torch CSR
     L_gpu = torch.sparse_csr_tensor(
         torch.tensor(L.indptr, dtype=torch.int64),
         torch.tensor(L.indices, dtype=torch.int64),
@@ -106,7 +114,7 @@ def main():
     parser.add_argument("--symbols-dict", required=True)
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--rows", type=int, default=None)
-    parser.add_argument("--batch", type=int, default=128)  # NEW
+    parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -117,8 +125,8 @@ def main():
     n_cells, n_genes = X_original.shape
     print(f"[INFO] Prediction shape: {X_original.shape}")
 
-    # Load symbol to Ensembl mapping
-    print(f"[INFO] Loading symbol to Ensembl mapping: {args.symbols_dict}")
+    # Load mapping
+    print(f"[INFO] Loading symbol→Ensembl mapping: {args.symbols_dict}")
     with open(args.symbols_dict, "rb") as f:
         mapping = pickle.load(f)
 
@@ -126,7 +134,6 @@ def main():
     mask_mapped = np.array([g is not None for g in gene_order])
     gene_order = np.array(gene_order)[mask_mapped].tolist()
 
-    # Extract mapped gene submatrix (still sparse)
     X_mapped = X_original[:, mask_mapped]
 
     # Load Laplacian
@@ -135,7 +142,6 @@ def main():
     )
     print(f"[INFO] GRN genes: {len(used_idx_local)}")
 
-    # Subset mapped genes to GRN overlap
     X_grn = X_mapped[:, used_idx_local]
 
     rows = X_grn.shape[0] if args.rows is None else args.rows
@@ -143,47 +149,9 @@ def main():
 
     smoothed = np.zeros((rows, len(used_idx_local)), dtype=np.float32)
 
-    # Batch CG smoothing
     batch = args.batch
 
     for start in range(0, rows, batch):
         end = min(start + batch, rows)
 
-        # Extract sparse rows & densify ON GPU
-        B = torch.tensor(
-            X_grn[start:end],
-            dtype=torch.float32,
-            device="cuda"
-        )
-
-        X_smooth = cg_batch_solve(L_gpu, B, tau=args.tau)
-        smoothed[start:end] = X_smooth.cpu().numpy()
-
-        print(f"[GPU CG] {start}/{rows} rows done")
-
-    # Insert smoothed rows
-    X_grn_dense = smoothed
-
-    # Reconstruct full matrix
-    print("[INFO] Reconstructing full matrix...")
-    full = np.zeros((n_cells, n_genes), dtype=np.float32)
-
-    mask_full = np.where(mask_mapped)[0]
-
-    # Insert GRN-smoothed genes
-    full[:, mask_full[used_idx_local]] = X_grn_dense
-
-    # Insert non-GRN mapped genes
-    non_grn = np.setdiff1d(np.arange(len(mask_full)), used_idx_local)
-
-    full[:, mask_full[non_grn]] = np.asarray(X_mapped[:, non_grn])
-    full[:, ~mask_mapped] = np.asarray(X_original[:, ~mask_mapped])
-
-    ad.X = full
-
-    print(f"[INFO] Writing output H5AD: {args.out}")
-    ad.write(args.out)
-
-
-if __name__ == "__main__":
-    main()
+        B = tor
