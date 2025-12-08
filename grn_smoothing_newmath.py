@@ -8,7 +8,9 @@ from scipy import sparse
 import torch
 import pickle
 
+# ============================================================
 # Conjugate Gradient with (L @ X.T).T instead of (X @ L)
+# ============================================================
 def cg_batch_solve(L_gpu, B, tau=0.1, tol=1e-3, max_iter=200):
     """
     Solve (I + τL) X = B
@@ -62,7 +64,9 @@ def cg_batch_solve(L_gpu, B, tau=0.1, tol=1e-3, max_iter=200):
     return X
 
 
+# ============================================================
 # Load Laplacian from GRN parquet
+# ============================================================
 def load_laplacian_from_parquet(path, gene_order):
     print(f"[INFO] Reading GRN parquet: {path}")
     df = pd.read_parquet(path)
@@ -107,6 +111,9 @@ def load_laplacian_from_parquet(path, gene_order):
     return L_gpu, used_idx, used_genes
 
 
+# ============================================================
+# Main
+# ============================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pred-h5ad", required=True)
@@ -151,7 +158,44 @@ def main():
 
     batch = args.batch
 
+    # ============================================================
+    # Batch smoothing using NEW matvec
+    # ============================================================
     for start in range(0, rows, batch):
         end = min(start + batch, rows)
 
-        B = tor
+        B = torch.tensor(
+            X_grn[start:end],
+            dtype=torch.float32,
+            device="cuda"
+        )
+
+        X_smooth = cg_batch_solve(L_gpu, B, tau=args.tau)
+        smoothed[start:end] = X_smooth.cpu().numpy()
+
+        print(f"[GPU CG] {start}/{rows} rows done")
+
+    # Insert smoothed results
+    X_grn_dense = smoothed
+
+    # Reassemble complete matrix
+    print("[INFO] Reconstructing full matrix...")
+    full = np.zeros((n_cells, n_genes), dtype=np.float32)
+
+    mask_full = np.where(mask_mapped)[0]
+
+    full[:, mask_full[used_idx_local]] = X_grn_dense
+
+    non_grn = np.setdiff1d(np.arange(len(mask_full)), used_idx_local)
+
+    full[:, mask_full[non_grn]] = np.asarray(X_mapped[:, non_grn])
+    full[:, ~mask_mapped] = np.asarray(X_original[:, ~mask_mapped])
+
+    ad.X = full
+
+    print(f"[INFO] Writing output H5AD: {args.out}")
+    ad.write(args.out)
+
+
+if __name__ == "__main__":
+    main()
